@@ -237,5 +237,96 @@ ggplot(Results_2020) +
 ########### Forecasting ####################
 # Get 2025 fixture
 afl_2025 <- fetch_fixture(2025)
+afl_data <- afl_2025
+year <- 2025
 
+restructure_afl_data <- function(afl_data, year) {
+  # Create home team perspective rows
+  afl_home <- data.frame(
+    Date = afl_data$match.date,
+    Season = 2025,  # Using the provided year parameter
+    Team = afl_data$match.homeTeam.name,
+    Opponent = afl_data$match.awayTeam.name,
+    status = 'SCHEDULED',
+    Home = TRUE,
+    ELO = NA,
+    Opp_ELO = NA
+  )
+  
+  # Create away team perspective rows
+  afl_away <- data.frame(
+    Date = afl_data$match.date,
+    Season = 2025,  # Using the provided year parameter
+    Team = afl_data$match.awayTeam.name,
+    Opponent = afl_data$match.homeTeam.name,
+    status = 'SCHEDULED',
+    Home = FALSE,
+    ELO = NA,
+    Opp_ELO = NA
+  )
+  
+  # Combine both perspectives
+  return(rbind(afl_home, afl_away))
+}
 
+restructured_dfs <- list()
+restructured_df <- restructure_afl_data(afl_2025, year)
+restructured_dfs[[as.character(year)]] <- restructured_df
+assign(paste0("afl_", year, "_restructured"), restructured_df)
+
+# Combine all restructured data frames into one
+afl_2025 <- do.call(rbind, restructured_dfs)
+
+# Get the most recent ELO for each team from afl_all_years
+get_latest_elo_by_team <- function(afl_all_years) {
+  # Ensure the data is sorted by date (most recent last)
+  afl_all_years <- afl_all_years[order(afl_all_years$Date), ]
+  
+  # Get the latest entry for each team that has a non-NA ELO value
+  latest_elos <- aggregate(
+    ELO ~ Team, 
+    data = afl_all_years[!is.na(afl_all_years$ELO), ], 
+    FUN = function(x) tail(x, 1)
+  )
+  
+  # Convert the result to a named vector for easier use
+  elo_vector <- setNames(latest_elos$ELO, latest_elos$Team)
+  
+  return(elo_vector)
+}
+
+# Apply the latest ELO ratings to the 2025 fixture
+apply_elo_to_fixture <- function(afl_2025, latest_elos) {
+  for (i in 1:nrow(afl_2025)) {
+    team <- afl_2025$Team[i]
+    opponent <- afl_2025$Opponent[i]
+    
+    # Assign ELO values if available
+    if (team %in% names(latest_elos)) {
+      afl_2025$ELO[i] <- latest_elos[team]
+    }
+    
+    if (opponent %in% names(latest_elos)) {
+      afl_2025$Opp_ELO[i] <- latest_elos[opponent]
+    }
+  }
+  
+  return(afl_2025)
+}
+
+# Get latest ELO ratings for each team
+latest_elos <- get_latest_elo_by_team(afl_all_years)
+
+# Print the latest ELO ratings for reference
+print(latest_elos)
+
+# Apply the ELO ratings to the 2025 fixture
+afl_2025 <- apply_elo_to_fixture(afl_2025, latest_elos)
+
+# Check the result
+dim(afl_2025) # Shows number of rows and columns
+colnames(afl_2025) # Shows column names
+
+afl_2025$Spread_Pred_lm_1 <- predict(spread_lm_1, newdata = afl_2025)
+afl_2025$win_prob_glm_1 <- predict(win_prob_glm_1, newdata = afl_2025, type = "response")
+View(afl_2025 %>% arrange(desc(win_prob_glm_1)))
