@@ -1,0 +1,57 @@
+Improvements for the AFL step by Step predictor 
+
+1. Tune the ELO K-factor dynamically
+
+Currently we are using a fixed K=20. But K can vary:
+Bigger for finals / early rounds (less certainty)
+Smaller for highly-rated teams or later rounds
+You could also increase K for games with larger point margins.
+Example: dynamic K-factor
+K <- ifelse(results$Season[i] >= 2000, 20, 30)  # larger for earlier games
+
+
+2. Account for Team Entry Bias
+Teams like GWS and Gold Coast should start with a lower initial ELO since they underperformed early.
+teams_elo$ELO[teams_elo$Team %in% c("Gold Coast", "GWS")] <- 1300
+
+3. Feature Engineering
+Add more predictors to your logistic regression model:
+Margin_Last_Game, Form_Last5 (e.g., average margin in last 5)
+Days_Since_Last_Game (rest days)
+State_Travelled_From or home state mismatch
+Team_Form_ELO (moving average ELO)
+
+Example:
+results <- results %>%
+  group_by(Team) %>%
+  arrange(Date) %>%
+  mutate(Avg_Margin_Last5 = zoo::rollapply(Spread, 5, mean, fill = NA, align = "right"))
+  
+4. Home Ground Advantage Calibration
+Right now it's binary. But home advantage varies:
+More for teams with unique home grounds (Geelong at GMHBA)
+Less if it’s MCG vs MCG (Coll vs Melb)
+Add a variable like Neutral_Ground, or use specific team-ground pairs for weighting.
+
+5. Confusion Matrix & ROC Curve
+Accuracy is great, but add precision/recall, AUC.
+
+library(pROC)
+roc_obj <- roc(results$Result_Binary, results$Win_Prob_Pred)
+auc(roc_obj)
+plot(roc_obj)
+
+6. Backtest Season-by-Season
+Create per-season model accuracy to check consistency.
+season_accuracy <- results %>%
+  group_by(Season) %>%
+  summarise(Accuracy = mean(GLM_Correct, na.rm = TRUE))
+  
+8. Model Calibration
+Plot predicted win probs vs actual outcomes (binned).
+results %>%
+  mutate(Prob_Bin = cut(Win_Prob_Pred, breaks=seq(0,1,0.1))) %>%
+  group_by(Prob_Bin) %>%
+  summarise(Accuracy = mean(Result_Binary)) %>%
+  ggplot(aes(x = Prob_Bin, y = Accuracy)) + geom_col()
+  
