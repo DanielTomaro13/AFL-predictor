@@ -4,26 +4,13 @@
 library(dplyr) # For data manipulation
 library(ggplot2) # Optional - for graphical visualisation
 library(fitzRoy) # For AFL data
+library(zoo)
+library(lubridate)
 
 # Fetch data 
-# Which source will we use?
-footywire <- fetch_results_footywire(2024) # goes back to 1897 - too slow to check
-colnames(footywire)
-
-afltables <- fetch_results_afltables(2024) # goes back to 1897 - this is also the quickest
-colnames(afltables)
-
-afl <- fetch_results_afl(2024)
-colnames(afl)
-
-squiggle <- fetch_fixture_squiggle(2024)
-colnames(squiggle)
-
-# I have chosen to go with AFL tables due to its speed and history
 results <- fetch_results_afltables(1897:2025)
 
-# Function to restructure data so each game has two entries one for home and one for away
-restructure_afl_data <- function(afl_data) {
+prepare_afl_model_data <- function(afl_data) {
   # Home team perspective
   afl_home <- data.frame(
     Date = afl_data$Date,
@@ -58,13 +45,53 @@ restructure_afl_data <- function(afl_data) {
     Opp_ELO = NA
   )
   
-  # Combine and return
-  return(bind_rows(afl_home, afl_away))
+  # Combine
+  afl_combined <- bind_rows(afl_home, afl_away) %>%
+    arrange(Team, Date)
+  
+  # Feature Engineering
+  afl_combined <- afl_combined %>%
+    group_by(Team) %>%
+    mutate(
+      # Rolling averages (5-game window)
+      avg_points_for = lag(rollapply(Points_For, width = 5, FUN = mean, align = "right", fill = NA, partial = TRUE)),
+      avg_points_against = lag(rollapply(Points_Against, width = 5, FUN = mean, align = "right", fill = NA, partial = TRUE)),
+
+      # Rolling form
+      Result_Num = ifelse(Result == "W", 1, 0),
+      form_last_5 = lag(rollapply(Result_Num, width = 5, FUN = sum, align = "right", fill = NA, partial = TRUE)),
+      
+      # Win streak counter
+      win_streak = lag(sequence(rle(Result == "W")$lengths) * (rle(Result == "W")$values == TRUE)),
+      
+      # Days since last match
+      rest_days = as.numeric(Date - lag(Date)),
+      
+      # Running home win % so far in the season
+      home_win = ifelse(Home & Result == "W", 1, 0),
+      home_games = ifelse(Home, 1, 0),
+      cumulative_home_wins = lag(cumsum(home_win)),
+      cumulative_home_games = lag(cumsum(home_games)),
+      home_win_pct_season = ifelse(Home, cumulative_home_wins / cumulative_home_games, NA)
+    ) %>%
+    ungroup()
+  
+  # Opponent form over last 5
+  opponent_form <- afl_combined %>%
+    select(Date, Team, form_last_5) %>%
+    rename(Opponent = Team, opponent_form_last_5 = form_last_5)
+  
+  afl_combined <- left_join(afl_combined, opponent_form, by = c("Date", "Opponent"))
+  
+  # Clean up temp columns
+  afl_combined <- afl_combined %>%
+    select(-Result_Num, -home_win, -home_games, -cumulative_home_wins, -cumulative_home_games)
+  
+  return(afl_combined)
 }
 
-results <- restructure_afl_data(results)
-# Check the result
-colnames(results)
+results <- prepare_afl_model_data(results)
+
 # So we can see we have added ELO, boolean values for if the row is related to the home or away team and a boolean result column in the form of W and L
 # Let us make everything numeric and get rid of NA for ELO
 results <- results %>% mutate(
@@ -167,45 +194,61 @@ results <- results %>%
 
 # Run Logistic Regression Model 
 # We use logistic regression as it is a classification model, there are two outcomes, win or lose therefore it will output a probability between 0-1. 
+# Fit improved logistic regression model
+# Filter rows with no missing predictors
+results_model <- results %>%
+  filter(
+    !is.na(Elo_Difference) &
+      !is.na(avg_points_for) &
+      !is.na(avg_points_against) &
+      !is.na(form_last_5) &
+      !is.na(opponent_form_last_5) &
+      !is.na(rest_days)
+  )
 
-win_prob_glm_1 <- glm(
-  Result_Binary ~ Elo_Difference + Home, # We take home team into account here, very basic model this is where you can add stuff to make it more advanced
+# Fit model on clean data
+win_prob_glm_advanced <- glm(
+  Result_Binary ~ 
+    Elo_Difference + 
+    Home + 
+    avg_points_for + 
+    avg_points_against + 
+    form_last_5 + 
+    opponent_form_last_5 +
+    rest_days,
   family = binomial,
-  data = results
-  # %>% filter(Season >= 1990 & Season <= 2024) # We can filter to use different parts of the data such as from 1990 when the VFL became the AFL
+  data = results_model
 )
+summary(win_prob_glm_advanced)
 
-# Output model summary
-summary(win_prob_glm_1)
+# Predict only on the clean data
+results_model$Win_Prob_Pred <- predict(win_prob_glm_advanced, type = "response")
 
+# Add predictions and evaluate
+results <- results_model %>%
+  mutate(
+    GLM_Forecast = ifelse(Win_Prob_Pred > 0.5, 1, 0),
+    GLM_Correct = ifelse(GLM_Forecast == Result_Binary, 1, 0)
+  )
 
-## Test Model
-
-# Predict probabilities
-results$Win_Prob_Pred <- predict(win_prob_glm_1, type = "response")
-
-# Accuracy of the model
-results <- results %>%
-  mutate(GLM_Forecast = ifelse(Win_Prob_Pred > 0.5, 1, 0),
-         GLM_Correct = ifelse(GLM_Forecast == Result_Binary, 1, 0))
-
-glm_accuracy <- mean(results$GLM_Correct, na.rm = TRUE)
+glm_accuracy <- mean(results_model$GLM_Correct, na.rm = TRUE)
 glm_accuracy * 100
 
-## Filter for 2025
+## --- Filter and Predict for 2025 Season --- ##
 
-results_2025 <- results %>% filter(Season == 2025)
+# Filter to games with complete predictions
+results_2025 <- results %>%
+  filter(Season == 2025 & !is.na(Win_Prob_Pred)) %>%
+  mutate(
+    GLM_Forecast = ifelse(Win_Prob_Pred > 0.5, 1, 0),
+    GLM_Correct = ifelse(GLM_Forecast == Result_Binary, 1, 0)
+  )
 
-# Accuracy of the model
-results_2025 <- results_2025 %>%
-  mutate(GLM_Forecast = ifelse(Win_Prob_Pred > 0.5, 1, 0),
-         GLM_Correct = ifelse(GLM_Forecast == Result_Binary, 1, 0))
-
+# Accuracy for 2025
 glm_accuracy_2025 <- mean(results_2025$GLM_Correct, na.rm = TRUE)
-glm_accuracy_2025 * 100
+cat("2025 GLM Accuracy: ", round(glm_accuracy_2025 * 100, 2), "%\n")
 
-# Ladder creation
-# ACTUAL ladder
+## --- Create Actual Ladder --- ##
 ladder_actual <- results_2025 %>%
   group_by(Team) %>%
   summarise(
@@ -217,43 +260,36 @@ ladder_actual <- results_2025 %>%
     Points_Actual = Wins_Actual * 4 + Draws_Actual * 2,
     Points_For = sum(Points_For),
     Points_Against = sum(Points_Against),
-    Percentage_Actual = round((Points_For / Points_Against) * 100, 1)
+    Percentage_Actual = round((Points_For / Points_Against) * 100, 1),
+    .groups = "drop"
   )
 
-# PREDICTED ladder
+## --- Create Predicted Ladder --- ##
 ladder_predicted <- results_2025 %>%
   group_by(Team) %>%
   summarise(
     Wins_Pred = sum(GLM_Forecast == 1),
     Losses_Pred = sum(GLM_Forecast == 0),
-    Draws_Pred = sum(Win_Prob_Pred > 0.45 & Win_Prob_Pred < 0.55),  # optional
+    Draws_Pred = sum(Win_Prob_Pred > 0.45 & Win_Prob_Pred < 0.55),  # Optional fuzzy draw
     WinPct_Pred = round(mean(GLM_Forecast) * 100, 1),
     Points_Pred = Wins_Pred * 4 + Draws_Pred * 2,
-    Percentage_Pred = round((sum(Points_For) / sum(Points_Against)) * 100, 1)
+    Percentage_Pred = round((sum(Points_For) / sum(Points_Against)) * 100, 1),
+    .groups = "drop"
   )
 
-# Merge both ladders
+## --- Merge Ladders and Compare --- ##
 ladder_comparison <- ladder_actual %>%
   left_join(ladder_predicted, by = "Team") %>%
-  arrange(desc(Points_Actual))
+  arrange(desc(Points_Actual)) %>%
+  mutate(
+    Point_Diff = Points_Pred - Points_Actual,
+    Rank_Actual = rank(-Points_Actual, ties.method = "min"),
+    Rank_Pred = rank(-Points_Pred, ties.method = "min"),
+    Rank_Diff = abs(Rank_Pred - Rank_Actual)
+  )
 
-ladder_comparison <- ladder_comparison %>%
-  mutate(Point_Diff = Points_Pred - Points_Actual,
-         Rank_Actual = rank(-Points_Actual),
-         Rank_Pred = rank(-Points_Pred),
-         Rank_Diff = abs(Rank_Pred - Rank_Actual))
+# Output average rank error
+cat("Average Rank Difference:", round(mean(ladder_comparison$Rank_Diff, na.rm = TRUE), 2), "\n")
 
-mean(ladder_comparison$Rank_Diff)
+# View the final comparison
 ladder_comparison
-
-
-
-
-
-
-
-
-
-
-
-
